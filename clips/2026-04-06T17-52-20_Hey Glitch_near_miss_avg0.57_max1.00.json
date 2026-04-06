@@ -1,0 +1,15 @@
+{
+  "detection_type": "near_miss",
+  "max_probability": 1.0,
+  "avg_probability": 0.569,
+  "sample_rate": 16000,
+  "bits_per_sample": 16,
+  "total_samples": 56000,
+  "total_chunks": 82,
+  "clip_id": 60148,
+  "wake_word": "Hey Glitch",
+  "filename": "2026-04-06T17-52-20_Hey Glitch_near_miss_avg0.57_max1.00.wav",
+  "timestamp": "2026-04-06T17-52-20",
+  "received_chunks": 3,
+  "audio_bytes": 4140
+}
