@@ -49,6 +49,12 @@ micro_wake_word:
     channels: 1
     gain_factor: 6
   stop_after_detection: false
+  clip_capture:
+    receiver_host: "192.168.1.100"    # IP of machine running clip_receiver.py
+    receiver_port: 12345
+    near_miss_threshold: 0.5           # Capture when prob > 50% of detection cutoff
+    preroll_ms: 3000                   # 3s before detection
+    postroll_ms: 500                   # 0.5s after detection
   on_wake_word_detected:
     # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
     - if:

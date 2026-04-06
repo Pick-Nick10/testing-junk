@@ -210,6 +210,8 @@ void WakeWordModel::disable() {
 DetectionEvent WakeWordModel::determine_detected() {
   DetectionEvent detection_event;
   detection_event.wake_word = &this->wake_word_;
+  detection_event.detected = false;
+  detection_event.partially_detection = false;
   detection_event.max_probability = 0;
   detection_event.average_probability = 0;
 
@@ -244,6 +246,9 @@ VADModel::VADModel(const uint8_t *model_start, uint8_t default_probability_cutof
 
 DetectionEvent VADModel::determine_detected() {
   DetectionEvent detection_event;
+  detection_event.wake_word = nullptr;
+  detection_event.detected = false;
+  detection_event.partially_detection = false;
   detection_event.max_probability = 0;
   detection_event.average_probability = 0;
 

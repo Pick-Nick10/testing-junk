@@ -16,7 +16,11 @@
 #include "esphome/components/ota/ota_backend.h"
 #endif
 
+#include <atomic>
+
 #include <freertos/event_groups.h>
+
+#include <lwip/sockets.h>
 
 #include <frontend.h>
 #include <frontend_util.h>
@@ -75,6 +79,12 @@ class MicroWakeWord : public Component
   // Intended for the voice assistant component to access which wake words are available
   // Since these are pointers to the WakeWordModel objects, the voice assistant component can enable or disable them
   std::vector<WakeWordModel *> get_wake_words();
+
+  // Clip capture configuration
+  void set_clip_receiver(const std::string &host, uint16_t port);
+  void set_near_miss_threshold_factor(float factor);
+  void set_clip_preroll_ms(uint32_t ms);
+  void set_clip_postroll_ms(uint32_t ms);
 
  protected:
   microphone::MicrophoneSource *microphone_source_{nullptr};
@@ -135,6 +145,49 @@ class MicroWakeWord : public Component
   /// @param audio_features (int8_t *) Buffer containing new spectrogram features
   /// @return True if successful, false if any errors were encountered
   bool update_model_probabilities_(const int8_t audio_features[PREPROCESSOR_FEATURE_SIZE]);
+
+  // --- Clip capture ---
+
+  /// @brief Writes audio data to the circular clip buffer
+  void write_to_clip_buffer_(const uint8_t *data, size_t len);
+  /// @brief Initiates a clip capture with post-roll delay
+  void trigger_clip_save_(const DetectionEvent &event);
+  /// @brief Sends the clip buffer over UDP (called from send task)
+  void send_clip_udp_();
+  /// @brief Initializes the UDP socket
+  bool init_clip_socket_();
+  /// @brief FreeRTOS task that sends clips over UDP
+  static void clip_send_task(void *params);
+
+  // Circular buffer (PSRAM)
+  uint8_t *clip_buffer_{nullptr};
+  size_t clip_buffer_size_{0};
+  size_t clip_write_pos_{0};
+
+  // Linear send buffer (PSRAM) — filled by mic callback, consumed by send task
+  uint8_t *clip_send_buffer_{nullptr};
+  size_t clip_send_buffer_size_{0};
+
+  // Clip state
+  std::atomic<bool> clip_capture_pending_{false};
+  std::atomic<uint32_t> clip_postroll_end_ms_{0};
+  DetectionEvent pending_clip_event_;       // Written by inference task, read by mic callback
+  DetectionEvent sending_clip_event_;       // Copied by mic callback, read by send task (safe: sequential)
+  uint32_t clip_cooldown_until_ms_{0};
+
+  // UDP
+  int clip_udp_socket_{-1};
+  struct sockaddr_in clip_udp_dest_;
+
+  // Send task
+  TaskHandle_t clip_send_task_handle_{nullptr};
+
+  // Configuration
+  std::string clip_receiver_host_;
+  uint16_t clip_receiver_port_{0};
+  float near_miss_threshold_factor_{0.5f};
+  uint32_t clip_preroll_ms_{3000};
+  uint32_t clip_postroll_ms_{500};
 };
 
 }  // namespace micro_wake_word

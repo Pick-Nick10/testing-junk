@@ -119,6 +119,41 @@ void MicroWakeWord::setup() {
     }
   });
 
+  // --- Clip capture setup ---
+  if (this->clip_receiver_port_ > 0) {
+    uint32_t total_clip_ms = this->clip_preroll_ms_ + this->clip_postroll_ms_;
+    this->clip_buffer_size_ = this->microphone_source_->get_audio_stream_info().ms_to_bytes(total_clip_ms);
+    this->clip_send_buffer_size_ = this->clip_buffer_size_;
+
+    RAMAllocator<uint8_t> allocator;
+    this->clip_buffer_ = allocator.allocate(this->clip_buffer_size_);
+    this->clip_send_buffer_ = allocator.allocate(this->clip_send_buffer_size_);
+
+    if (this->clip_buffer_ == nullptr || this->clip_send_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate clip capture buffers (%u bytes each)", this->clip_buffer_size_);
+      // Free whichever succeeded to avoid leak/null-deref mismatch
+      if (this->clip_buffer_ != nullptr) { allocator.deallocate(this->clip_buffer_, this->clip_buffer_size_); this->clip_buffer_ = nullptr; }
+      if (this->clip_send_buffer_ != nullptr) { allocator.deallocate(this->clip_send_buffer_, this->clip_send_buffer_size_); this->clip_send_buffer_ = nullptr; }
+      this->clip_receiver_port_ = 0;  // Disable clip capture entirely
+    } else {
+      memset(this->clip_buffer_, 0, this->clip_buffer_size_);
+      ESP_LOGI(TAG, "Clip capture: %u ms buffer (%u bytes), sending to %s:%u",
+               total_clip_ms, this->clip_buffer_size_,
+               this->clip_receiver_host_.c_str(), this->clip_receiver_port_);
+
+      // Register a second data callback for clip capture
+      this->microphone_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
+        this->write_to_clip_buffer_(data.data(), data.size());
+      });
+
+      this->init_clip_socket_();
+
+      // Create the clip send task (low priority, doesn't block mic/inference)
+      xTaskCreatePinnedToCore(MicroWakeWord::clip_send_task, "mww_clip", 4096, (void *) this,
+                              5, &this->clip_send_task_handle_, 0);
+    }
+  }
+
 #ifdef USE_OTA_STATE_LISTENER
   ota::get_global_ota_callback()->add_global_state_listener(this);
 #endif
@@ -231,11 +266,17 @@ void MicroWakeWord::suspend_task_() {
   if (this->inference_task_handle_ != nullptr) {
     vTaskSuspend(this->inference_task_handle_);
   }
+  if (this->clip_send_task_handle_ != nullptr) {
+    vTaskSuspend(this->clip_send_task_handle_);
+  }
 }
 
 void MicroWakeWord::resume_task_() {
   if (this->inference_task_handle_ != nullptr) {
     vTaskResume(this->inference_task_handle_);
+  }
+  if (this->clip_send_task_handle_ != nullptr) {
+    vTaskResume(this->clip_send_task_handle_);
   }
 }
 
@@ -428,7 +469,7 @@ void MicroWakeWord::process_probabilities_() {
 #ifdef USE_MICRO_WAKE_WORD_VAD
         if (vad_state.detected) {
 #endif
-          xQueueSend(this->detection_queue_, &wake_word_state, portMAX_DELAY);
+          xQueueSend(this->detection_queue_, &wake_word_state, pdMS_TO_TICKS(100));
 
           // Wake main loop immediately to process wake word detection
 #if defined(USE_SOCKET_SELECT_SUPPORT) && defined(USE_WAKE_LOOP_THREADSAFE)
@@ -436,12 +477,29 @@ void MicroWakeWord::process_probabilities_() {
 #endif
 
           model->reset_probabilities();
+
+          // Trigger clip save for successful detection
+          this->trigger_clip_save_(wake_word_state);
+
 #ifdef USE_MICRO_WAKE_WORD_VAD
         } else {
           wake_word_state.blocked_by_vad = true;
-          xQueueSend(this->detection_queue_, &wake_word_state, portMAX_DELAY);
+          xQueueSend(this->detection_queue_, &wake_word_state, pdMS_TO_TICKS(100));
+
+          // Trigger clip save for VAD-blocked detection
+          this->trigger_clip_save_(wake_word_state);
         }
 #endif
+      } else {
+        // Near-miss detection: probability above threshold but below cutoff
+        uint8_t near_miss_cutoff =
+            static_cast<uint8_t>(model->get_probability_cutoff() * this->near_miss_threshold_factor_);
+        if (wake_word_state.average_probability > near_miss_cutoff &&
+            !this->clip_capture_pending_.load() &&
+            (int32_t)(millis() - this->clip_cooldown_until_ms_) >= 0) {
+          wake_word_state.partially_detection = true;
+          this->trigger_clip_save_(wake_word_state);
+        }
       }
     }
   }
@@ -468,6 +526,180 @@ bool MicroWakeWord::update_model_probabilities_(const int8_t audio_features[PREP
 #endif
 
   return success;
+}
+
+// --- Clip capture implementation ---
+
+void MicroWakeWord::set_clip_receiver(const std::string &host, uint16_t port) {
+  this->clip_receiver_host_ = host;
+  this->clip_receiver_port_ = port;
+}
+
+void MicroWakeWord::set_near_miss_threshold_factor(float factor) { this->near_miss_threshold_factor_ = factor; }
+void MicroWakeWord::set_clip_preroll_ms(uint32_t ms) { this->clip_preroll_ms_ = ms; }
+void MicroWakeWord::set_clip_postroll_ms(uint32_t ms) { this->clip_postroll_ms_ = ms; }
+
+void MicroWakeWord::write_to_clip_buffer_(const uint8_t *data, size_t len) {
+  if (len == 0 || this->clip_buffer_ == nullptr)
+    return;
+
+  // Clamp to buffer size to prevent overflow if chunk > buffer
+  if (len > this->clip_buffer_size_) {
+    data += (len - this->clip_buffer_size_);
+    len = this->clip_buffer_size_;
+  }
+
+  // Write to circular buffer
+  size_t first_chunk = std::min(len, this->clip_buffer_size_ - this->clip_write_pos_);
+  memcpy(this->clip_buffer_ + this->clip_write_pos_, data, first_chunk);
+  if (first_chunk < len) {
+    memcpy(this->clip_buffer_, data + first_chunk, len - first_chunk);
+  }
+  this->clip_write_pos_ = (this->clip_write_pos_ + len) % this->clip_buffer_size_;
+
+  // Check if post-roll period has elapsed
+  if (this->clip_capture_pending_.load() &&
+      ((int32_t)(millis() - this->clip_postroll_end_ms_.load()) >= 0)) {
+    // Snapshot the event for the send task BEFORE clearing the pending flag.
+    // This prevents the inference task from overwriting pending_clip_event_
+    // while the send task is reading it.
+    this->sending_clip_event_ = this->pending_clip_event_;
+    this->clip_capture_pending_.store(false);
+
+    // Linearize circular buffer into send buffer (oldest sample first)
+    size_t read_pos = this->clip_write_pos_;
+    size_t first_part = this->clip_buffer_size_ - read_pos;
+    memcpy(this->clip_send_buffer_, this->clip_buffer_ + read_pos, first_part);
+    if (first_part < this->clip_buffer_size_) {
+      memcpy(this->clip_send_buffer_ + first_part, this->clip_buffer_, this->clip_buffer_size_ - first_part);
+    }
+
+    // Notify the send task
+    if (this->clip_send_task_handle_ != nullptr) {
+      xTaskNotifyGive(this->clip_send_task_handle_);
+    }
+  }
+}
+
+void MicroWakeWord::trigger_clip_save_(const DetectionEvent &event) {
+  if (this->clip_buffer_ == nullptr || this->clip_receiver_port_ == 0)
+    return;
+  if (this->clip_capture_pending_.load())
+    return;
+
+  this->pending_clip_event_ = event;
+  this->clip_postroll_end_ms_.store(millis() + this->clip_postroll_ms_);
+  this->clip_capture_pending_.store(true);
+
+  // Set cooldown (10 seconds) to prevent near-miss flooding
+  this->clip_cooldown_until_ms_ = millis() + 10000;
+}
+
+void MicroWakeWord::clip_send_task(void *params) {
+  MicroWakeWord *this_mww = (MicroWakeWord *) params;
+
+  while (true) {
+    // Block until notified by write_to_clip_buffer_
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    this_mww->send_clip_udp_();
+  }
+}
+
+void MicroWakeWord::send_clip_udp_() {
+  if (this->clip_udp_socket_ < 0) {
+    if (!this->init_clip_socket_())
+      return;
+  }
+
+  static const size_t FIRST_HEADER_SIZE = 56;
+  static const size_t DATA_HEADER_SIZE = 10;
+  static const size_t MAX_AUDIO_PER_PACKET = 1380;
+
+  uint32_t clip_id = millis();
+  size_t total_audio = this->clip_send_buffer_size_;
+  uint16_t total_chunks = (total_audio + MAX_AUDIO_PER_PACKET - 1) / MAX_AUDIO_PER_PACKET;
+
+  // Detection type
+  uint8_t det_type = 0;  // detected
+  if (this->sending_clip_event_.blocked_by_vad)
+    det_type = 2;
+  else if (this->sending_clip_event_.partially_detection)
+    det_type = 1;
+
+  uint8_t packet_buf[1500];
+  size_t audio_sent = 0;
+
+  for (uint16_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
+    size_t header_size;
+
+    if (chunk_idx == 0) {
+      // First packet: full header
+      header_size = FIRST_HEADER_SIZE;
+      memcpy(packet_buf, "MWWC", 4);
+      packet_buf[4] = 1;  // protocol version
+      packet_buf[5] = det_type;
+      packet_buf[6] = this->sending_clip_event_.max_probability;
+      packet_buf[7] = this->sending_clip_event_.average_probability;
+
+      uint16_t sr = 16000;
+      uint16_t bps = 16;
+      uint32_t total_samples = total_audio / sizeof(int16_t);
+      memcpy(packet_buf + 8, &sr, 2);
+      memcpy(packet_buf + 10, &bps, 2);
+      memcpy(packet_buf + 12, &total_samples, 4);
+      memcpy(packet_buf + 16, &total_chunks, 2);
+      memcpy(packet_buf + 18, &chunk_idx, 2);
+      memcpy(packet_buf + 20, &clip_id, 4);
+
+      // Wake word name (32 bytes, null-padded)
+      memset(packet_buf + 24, 0, 32);
+      if (this->sending_clip_event_.wake_word != nullptr) {
+        strncpy((char *) (packet_buf + 24), this->sending_clip_event_.wake_word->c_str(), 31);
+      }
+    } else {
+      // Subsequent packets: minimal header
+      header_size = DATA_HEADER_SIZE;
+      memcpy(packet_buf, "MWWC", 4);
+      memcpy(packet_buf + 4, &clip_id, 4);
+      memcpy(packet_buf + 8, &chunk_idx, 2);
+    }
+
+    size_t audio_this_packet = std::min(MAX_AUDIO_PER_PACKET, total_audio - audio_sent);
+    memcpy(packet_buf + header_size, this->clip_send_buffer_ + audio_sent, audio_this_packet);
+    audio_sent += audio_this_packet;
+
+    int sent = lwip_sendto(this->clip_udp_socket_, packet_buf, header_size + audio_this_packet, 0,
+                           (struct sockaddr *) &this->clip_udp_dest_, sizeof(this->clip_udp_dest_));
+    if (sent < 0) {
+      ESP_LOGW(TAG, "Clip UDP send failed at chunk %u: errno %d", chunk_idx, errno);
+      break;  // Abort sending this clip
+    }
+
+    vTaskDelay(1);  // Yield between packets
+  }
+
+  ESP_LOGI(TAG, "Sent clip: wake_word=%s type=%u prob_avg=%u prob_max=%u chunks=%u",
+           this->sending_clip_event_.wake_word ? this->sending_clip_event_.wake_word->c_str() : "?", det_type,
+           this->sending_clip_event_.average_probability, this->sending_clip_event_.max_probability, total_chunks);
+}
+
+bool MicroWakeWord::init_clip_socket_() {
+  if (this->clip_receiver_host_.empty() || this->clip_receiver_port_ == 0)
+    return false;
+
+  this->clip_udp_socket_ = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (this->clip_udp_socket_ < 0) {
+    ESP_LOGE(TAG, "Failed to create clip UDP socket: errno %d", errno);
+    return false;
+  }
+
+  memset(&this->clip_udp_dest_, 0, sizeof(this->clip_udp_dest_));
+  this->clip_udp_dest_.sin_family = AF_INET;
+  this->clip_udp_dest_.sin_port = htons(this->clip_receiver_port_);
+  this->clip_udp_dest_.sin_addr.s_addr = inet_addr(this->clip_receiver_host_.c_str());
+
+  ESP_LOGI(TAG, "Clip UDP target: %s:%u", this->clip_receiver_host_.c_str(), this->clip_receiver_port_);
+  return true;
 }
 
 }  // namespace micro_wake_word

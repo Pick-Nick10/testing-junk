@@ -46,6 +46,14 @@ CONF_STOP_AFTER_DETECTION = "stop_after_detection"
 CONF_TENSOR_ARENA_SIZE = "tensor_arena_size"
 CONF_VAD = "vad"
 
+# Clip capture
+CONF_CLIP_CAPTURE = "clip_capture"
+CONF_CLIP_RECEIVER_HOST = "receiver_host"
+CONF_CLIP_RECEIVER_PORT = "receiver_port"
+CONF_NEAR_MISS_THRESHOLD = "near_miss_threshold"
+CONF_CLIP_PREROLL_MS = "preroll_ms"
+CONF_CLIP_POSTROLL_MS = "postroll_ms"
+
 TYPE_HTTP = "http"
 
 micro_wake_word_ns = cg.esphome_ns.namespace("micro_wake_word")
@@ -366,6 +374,17 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SLIDING_WINDOW_AVERAGE_SIZE): cv.invalid(
                 f"The {CONF_SLIDING_WINDOW_AVERAGE_SIZE} parameter has been renamed to {CONF_SLIDING_WINDOW_SIZE} and moved to be a list element under the {CONF_MODELS} parameter."
             ),
+            cv.Optional(CONF_CLIP_CAPTURE): cv.Schema(
+                {
+                    cv.Required(CONF_CLIP_RECEIVER_HOST): cv.string,  # Must be an IPv4 address (no hostnames)
+                    cv.Required(CONF_CLIP_RECEIVER_PORT): cv.port,
+                    cv.Optional(CONF_NEAR_MISS_THRESHOLD, default=0.5): cv.float_range(
+                        min=0.0, max=1.0
+                    ),
+                    cv.Optional(CONF_CLIP_PREROLL_MS, default=3000): cv.int_range(min=500, max=30000),
+                    cv.Optional(CONF_CLIP_POSTROLL_MS, default=500): cv.int_range(min=0, max=5000),
+                }
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -524,6 +543,17 @@ async def to_code(config):
             [(cg.std_string, "wake_word")],
             on_wake_word_detection_config,
         )
+
+    if clip_config := config.get(CONF_CLIP_CAPTURE):
+        cg.add(
+            var.set_clip_receiver(
+                clip_config[CONF_CLIP_RECEIVER_HOST],
+                clip_config[CONF_CLIP_RECEIVER_PORT],
+            )
+        )
+        cg.add(var.set_near_miss_threshold_factor(clip_config[CONF_NEAR_MISS_THRESHOLD]))
+        cg.add(var.set_clip_preroll_ms(clip_config[CONF_CLIP_PREROLL_MS]))
+        cg.add(var.set_clip_postroll_ms(clip_config[CONF_CLIP_POSTROLL_MS]))
 
 
 MICRO_WAKE_WORD_ACTION_SCHEMA = cv.Schema({cv.GenerateID(): cv.use_id(MicroWakeWord)})
