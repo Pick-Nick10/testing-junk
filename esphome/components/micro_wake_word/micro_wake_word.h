@@ -85,6 +85,7 @@ class MicroWakeWord : public Component
   void set_near_miss_threshold_factor(float factor);
   void set_clip_preroll_ms(uint32_t ms);
   void set_clip_postroll_ms(uint32_t ms);
+  void set_clip_gain_factor(uint8_t gain) { this->clip_gain_factor_ = gain; }
 
  protected:
   microphone::MicrophoneSource *microphone_source_{nullptr};
@@ -188,6 +189,7 @@ class MicroWakeWord : public Component
   float near_miss_threshold_factor_{0.5f};
   uint32_t clip_preroll_ms_{3000};
   uint32_t clip_postroll_ms_{500};
+  uint8_t clip_gain_factor_{1};  // Gain applied to clip audio (1 = no gain)
 };
 
 }  // namespace micro_wake_word

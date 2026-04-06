@@ -53,6 +53,7 @@ CONF_CLIP_RECEIVER_PORT = "receiver_port"
 CONF_NEAR_MISS_THRESHOLD = "near_miss_threshold"
 CONF_CLIP_PREROLL_MS = "preroll_ms"
 CONF_CLIP_POSTROLL_MS = "postroll_ms"
+CONF_CLIP_GAIN_FACTOR = "gain_factor"
 
 TYPE_HTTP = "http"
 
@@ -383,6 +384,7 @@ CONFIG_SCHEMA = cv.All(
                     ),
                     cv.Optional(CONF_CLIP_PREROLL_MS, default=3000): cv.int_range(min=500, max=30000),
                     cv.Optional(CONF_CLIP_POSTROLL_MS, default=500): cv.int_range(min=0, max=5000),
+                    cv.Optional(CONF_CLIP_GAIN_FACTOR, default=6): cv.int_range(min=1, max=64),
                 }
             ),
         }
@@ -554,6 +556,7 @@ async def to_code(config):
         cg.add(var.set_near_miss_threshold_factor(clip_config[CONF_NEAR_MISS_THRESHOLD]))
         cg.add(var.set_clip_preroll_ms(clip_config[CONF_CLIP_PREROLL_MS]))
         cg.add(var.set_clip_postroll_ms(clip_config[CONF_CLIP_POSTROLL_MS]))
+        cg.add(var.set_clip_gain_factor(clip_config[CONF_CLIP_GAIN_FACTOR]))
 
 
 MICRO_WAKE_WORD_ACTION_SCHEMA = cv.Schema({cv.GenerateID(): cv.use_id(MicroWakeWord)})

@@ -549,13 +549,34 @@ void MicroWakeWord::write_to_clip_buffer_(const uint8_t *data, size_t len) {
     len = this->clip_buffer_size_;
   }
 
-  // Write to circular buffer
-  size_t first_chunk = std::min(len, this->clip_buffer_size_ - this->clip_write_pos_);
-  memcpy(this->clip_buffer_ + this->clip_write_pos_, data, first_chunk);
-  if (first_chunk < len) {
-    memcpy(this->clip_buffer_, data + first_chunk, len - first_chunk);
+  // Apply gain to match what the wake word model hears.
+  // The mic delivers 16-bit PCM samples; amplify each by clip_gain_factor_.
+  if (this->clip_gain_factor_ > 1) {
+    const int16_t *src = reinterpret_cast<const int16_t *>(data);
+    size_t num_samples = len / sizeof(int16_t);
+    size_t write_pos = this->clip_write_pos_;
+
+    for (size_t i = 0; i < num_samples; ++i) {
+      int32_t amplified = static_cast<int32_t>(src[i]) * this->clip_gain_factor_;
+      // Clamp to int16 range
+      if (amplified > INT16_MAX) amplified = INT16_MAX;
+      if (amplified < INT16_MIN) amplified = INT16_MIN;
+
+      // Write 2 bytes to circular buffer
+      this->clip_buffer_[write_pos] = static_cast<uint8_t>(amplified & 0xFF);
+      this->clip_buffer_[write_pos + 1] = static_cast<uint8_t>((amplified >> 8) & 0xFF);
+      write_pos = (write_pos + sizeof(int16_t)) % this->clip_buffer_size_;
+    }
+    this->clip_write_pos_ = write_pos;
+  } else {
+    // No gain — fast memcpy path
+    size_t first_chunk = std::min(len, this->clip_buffer_size_ - this->clip_write_pos_);
+    memcpy(this->clip_buffer_ + this->clip_write_pos_, data, first_chunk);
+    if (first_chunk < len) {
+      memcpy(this->clip_buffer_, data + first_chunk, len - first_chunk);
+    }
+    this->clip_write_pos_ = (this->clip_write_pos_ + len) % this->clip_buffer_size_;
   }
-  this->clip_write_pos_ = (this->clip_write_pos_ + len) % this->clip_buffer_size_;
 
   // Check if post-roll period has elapsed
   if (this->clip_capture_pending_.load() &&
