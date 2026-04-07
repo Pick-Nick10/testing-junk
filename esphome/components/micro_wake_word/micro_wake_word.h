@@ -151,6 +151,8 @@ class MicroWakeWord : public Component
 
   /// @brief Writes audio data to the circular clip buffer
   void write_to_clip_buffer_(const uint8_t *data, size_t len);
+  /// @brief Writes the current max probability across models to the probability ring buffer
+  void write_probability_(uint8_t probability);
   /// @brief Initiates a clip capture with post-roll delay
   void trigger_clip_save_(const DetectionEvent &event);
   /// @brief Sends the clip buffer over UDP (called from send task)
@@ -160,7 +162,7 @@ class MicroWakeWord : public Component
   /// @brief FreeRTOS task that sends clips over UDP
   static void clip_send_task(void *params);
 
-  // Circular buffer (PSRAM)
+  // Circular audio buffer (PSRAM)
   uint8_t *clip_buffer_{nullptr};
   size_t clip_buffer_size_{0};
   size_t clip_write_pos_{0};
@@ -168,6 +170,13 @@ class MicroWakeWord : public Component
   // Linear send buffer (PSRAM) — filled by mic callback, consumed by send task
   uint8_t *clip_send_buffer_{nullptr};
   size_t clip_send_buffer_size_{0};
+
+  // Probability timeline ring buffer — written by inference task, one uint8 per step
+  uint8_t *prob_buffer_{nullptr};
+  size_t prob_buffer_size_{0};     // number of entries (= total_clip_ms / features_step_size)
+  size_t prob_write_pos_{0};
+  // Linear copy for sending
+  uint8_t *prob_send_buffer_{nullptr};
 
   // Clip state
   std::atomic<bool> clip_capture_pending_{false};

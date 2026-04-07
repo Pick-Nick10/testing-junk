@@ -125,18 +125,26 @@ void MicroWakeWord::setup() {
     this->clip_buffer_size_ = this->microphone_source_->get_audio_stream_info().ms_to_bytes(total_clip_ms);
     this->clip_send_buffer_size_ = this->clip_buffer_size_;
 
+    // Probability buffer: one uint8 per inference step across the clip duration
+    this->prob_buffer_size_ = total_clip_ms / this->features_step_size_;
+
     RAMAllocator<uint8_t> allocator;
     this->clip_buffer_ = allocator.allocate(this->clip_buffer_size_);
     this->clip_send_buffer_ = allocator.allocate(this->clip_send_buffer_size_);
+    this->prob_buffer_ = allocator.allocate(this->prob_buffer_size_);
+    this->prob_send_buffer_ = allocator.allocate(this->prob_buffer_size_);
 
-    if (this->clip_buffer_ == nullptr || this->clip_send_buffer_ == nullptr) {
-      ESP_LOGE(TAG, "Failed to allocate clip capture buffers (%u bytes each)", this->clip_buffer_size_);
-      // Free whichever succeeded to avoid leak/null-deref mismatch
+    if (this->clip_buffer_ == nullptr || this->clip_send_buffer_ == nullptr ||
+        this->prob_buffer_ == nullptr || this->prob_send_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate clip capture buffers");
       if (this->clip_buffer_ != nullptr) { allocator.deallocate(this->clip_buffer_, this->clip_buffer_size_); this->clip_buffer_ = nullptr; }
       if (this->clip_send_buffer_ != nullptr) { allocator.deallocate(this->clip_send_buffer_, this->clip_send_buffer_size_); this->clip_send_buffer_ = nullptr; }
-      this->clip_receiver_port_ = 0;  // Disable clip capture entirely
+      if (this->prob_buffer_ != nullptr) { allocator.deallocate(this->prob_buffer_, this->prob_buffer_size_); this->prob_buffer_ = nullptr; }
+      if (this->prob_send_buffer_ != nullptr) { allocator.deallocate(this->prob_send_buffer_, this->prob_buffer_size_); this->prob_send_buffer_ = nullptr; }
+      this->clip_receiver_port_ = 0;
     } else {
       memset(this->clip_buffer_, 0, this->clip_buffer_size_);
+      memset(this->prob_buffer_, 0, this->prob_buffer_size_);
       ESP_LOGI(TAG, "Clip capture: %u ms buffer (%u bytes), sending to %s:%u",
                total_clip_ms, this->clip_buffer_size_,
                this->clip_receiver_host_.c_str(), this->clip_receiver_port_);
@@ -461,10 +469,17 @@ void MicroWakeWord::process_probabilities_() {
   this->vad_state_ = vad_state.detected;  // atomic write, so thread safe
 #endif
 
+  uint8_t max_prob_this_step = 0;
+  bool had_new_prob = false;
+
   for (auto &model : this->wake_word_models_) {
     if (model->get_unprocessed_probability_status()) {
       // Only detect wake words if there is a new probability since the last check
       DetectionEvent wake_word_state = model->determine_detected();
+      had_new_prob = true;
+      if (wake_word_state.average_probability > max_prob_this_step)
+        max_prob_this_step = wake_word_state.average_probability;
+
       if (wake_word_state.detected) {
 #ifdef USE_MICRO_WAKE_WORD_VAD
         if (vad_state.detected) {
@@ -502,6 +517,11 @@ void MicroWakeWord::process_probabilities_() {
         }
       }
     }
+  }
+
+  // Write max probability to the probability ring buffer
+  if (had_new_prob) {
+    this->write_probability_(max_prob_this_step);
   }
 }
 
@@ -575,6 +595,16 @@ void MicroWakeWord::write_to_clip_buffer_(const uint8_t *data, size_t len) {
       memcpy(this->clip_send_buffer_ + first_part, this->clip_buffer_, this->clip_buffer_size_ - first_part);
     }
 
+    // Linearize probability ring buffer
+    if (this->prob_buffer_ != nullptr && this->prob_send_buffer_ != nullptr) {
+      size_t prob_read_pos = this->prob_write_pos_;
+      size_t prob_first = this->prob_buffer_size_ - prob_read_pos;
+      memcpy(this->prob_send_buffer_, this->prob_buffer_ + prob_read_pos, prob_first);
+      if (prob_first < this->prob_buffer_size_) {
+        memcpy(this->prob_send_buffer_ + prob_first, this->prob_buffer_, this->prob_buffer_size_ - prob_first);
+      }
+    }
+
     // Apply gain to the linearized send buffer (not in the real-time path)
     if (this->clip_gain_factor_ > 1) {
       int16_t *samples = reinterpret_cast<int16_t *>(this->clip_send_buffer_);
@@ -592,6 +622,13 @@ void MicroWakeWord::write_to_clip_buffer_(const uint8_t *data, size_t len) {
       xTaskNotifyGive(this->clip_send_task_handle_);
     }
   }
+}
+
+void MicroWakeWord::write_probability_(uint8_t probability) {
+  if (this->prob_buffer_ == nullptr)
+    return;
+  this->prob_buffer_[this->prob_write_pos_] = probability;
+  this->prob_write_pos_ = (this->prob_write_pos_ + 1) % this->prob_buffer_size_;
 }
 
 void MicroWakeWord::trigger_clip_save_(const DetectionEvent &event) {
@@ -624,13 +661,16 @@ void MicroWakeWord::send_clip_udp_() {
       return;
   }
 
-  static const size_t FIRST_HEADER_SIZE = 56;
+  // Protocol v2: first packet header is 60 bytes (added prob_count + prob_step_ms)
+  static const size_t FIRST_HEADER_SIZE = 60;
   static const size_t DATA_HEADER_SIZE = 10;
   static const size_t MAX_AUDIO_PER_PACKET = 1380;
 
   uint32_t clip_id = millis();
   size_t total_audio = this->clip_send_buffer_size_;
-  uint16_t total_chunks = (total_audio + MAX_AUDIO_PER_PACKET - 1) / MAX_AUDIO_PER_PACKET;
+  // Audio chunks + 1 final chunk for probability data
+  uint16_t audio_chunks = (total_audio + MAX_AUDIO_PER_PACKET - 1) / MAX_AUDIO_PER_PACKET;
+  uint16_t total_chunks = audio_chunks + 1;  // +1 for probability packet
 
   // Detection type
   uint8_t det_type = 0;  // detected
@@ -644,12 +684,13 @@ void MicroWakeWord::send_clip_udp_() {
 
   for (uint16_t chunk_idx = 0; chunk_idx < total_chunks; ++chunk_idx) {
     size_t header_size;
+    size_t payload_size;
 
     if (chunk_idx == 0) {
       // First packet: full header
       header_size = FIRST_HEADER_SIZE;
       memcpy(packet_buf, "MWWC", 4);
-      packet_buf[4] = 1;  // protocol version
+      packet_buf[4] = 2;  // protocol version 2
       packet_buf[5] = det_type;
       packet_buf[6] = this->sending_clip_event_.max_probability;
       packet_buf[7] = this->sending_clip_event_.average_probability;
@@ -669,31 +710,58 @@ void MicroWakeWord::send_clip_udp_() {
       if (this->sending_clip_event_.wake_word != nullptr) {
         strncpy((char *) (packet_buf + 24), this->sending_clip_event_.wake_word->c_str(), 31);
       }
-    } else {
-      // Subsequent packets: minimal header
+
+      // Probability metadata (v2 addition)
+      uint16_t prob_count = this->prob_buffer_size_;
+      uint16_t prob_step_ms = this->features_step_size_;
+      memcpy(packet_buf + 56, &prob_count, 2);
+      memcpy(packet_buf + 58, &prob_step_ms, 2);
+
+      // Audio payload
+      payload_size = std::min(MAX_AUDIO_PER_PACKET, total_audio - audio_sent);
+      memcpy(packet_buf + header_size, this->clip_send_buffer_ + audio_sent, payload_size);
+      audio_sent += payload_size;
+
+    } else if (chunk_idx < audio_chunks) {
+      // Audio data packets
       header_size = DATA_HEADER_SIZE;
       memcpy(packet_buf, "MWWC", 4);
       memcpy(packet_buf + 4, &clip_id, 4);
       memcpy(packet_buf + 8, &chunk_idx, 2);
+
+      payload_size = std::min(MAX_AUDIO_PER_PACKET, total_audio - audio_sent);
+      memcpy(packet_buf + header_size, this->clip_send_buffer_ + audio_sent, payload_size);
+      audio_sent += payload_size;
+
+    } else {
+      // Final packet: probability timeline data
+      header_size = DATA_HEADER_SIZE;
+      memcpy(packet_buf, "MWWC", 4);
+      memcpy(packet_buf + 4, &clip_id, 4);
+      memcpy(packet_buf + 8, &chunk_idx, 2);
+
+      payload_size = this->prob_buffer_size_;
+      if (this->prob_send_buffer_ != nullptr && payload_size <= (sizeof(packet_buf) - header_size)) {
+        memcpy(packet_buf + header_size, this->prob_send_buffer_, payload_size);
+      } else {
+        payload_size = 0;
+      }
     }
 
-    size_t audio_this_packet = std::min(MAX_AUDIO_PER_PACKET, total_audio - audio_sent);
-    memcpy(packet_buf + header_size, this->clip_send_buffer_ + audio_sent, audio_this_packet);
-    audio_sent += audio_this_packet;
-
-    int sent = lwip_sendto(this->clip_udp_socket_, packet_buf, header_size + audio_this_packet, 0,
+    int sent = lwip_sendto(this->clip_udp_socket_, packet_buf, header_size + payload_size, 0,
                            (struct sockaddr *) &this->clip_udp_dest_, sizeof(this->clip_udp_dest_));
     if (sent < 0) {
       ESP_LOGW(TAG, "Clip UDP send failed at chunk %u: errno %d", chunk_idx, errno);
-      break;  // Abort sending this clip
+      break;
     }
 
-    vTaskDelay(1);  // Yield between packets
+    vTaskDelay(1);
   }
 
-  ESP_LOGI(TAG, "Sent clip: wake_word=%s type=%u prob_avg=%u prob_max=%u chunks=%u",
+  ESP_LOGI(TAG, "Sent clip: wake_word=%s type=%u prob_avg=%u prob_max=%u chunks=%u prob_points=%u",
            this->sending_clip_event_.wake_word ? this->sending_clip_event_.wake_word->c_str() : "?", det_type,
-           this->sending_clip_event_.average_probability, this->sending_clip_event_.max_probability, total_chunks);
+           this->sending_clip_event_.average_probability, this->sending_clip_event_.max_probability,
+           total_chunks, this->prob_buffer_size_);
 }
 
 bool MicroWakeWord::init_clip_socket_() {

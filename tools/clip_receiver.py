@@ -43,7 +43,8 @@ from pathlib import Path
 MAGIC = b"MWWC"
 DETECTION_TYPES = {0: "detected", 1: "near_miss", 2: "vad_blocked"}
 
-FIRST_HEADER_SIZE = 56
+FIRST_HEADER_SIZE_V1 = 56
+FIRST_HEADER_SIZE_V2 = 60
 DATA_HEADER_SIZE = 10
 CLIP_TIMEOUT_SECONDS = 5.0
 
@@ -54,6 +55,7 @@ class ClipAssembler:
         self.metadata = metadata
         self.chunks = {}
         self.total_chunks = metadata["total_chunks"]
+        self.prob_chunk_index = self.total_chunks - 1 if metadata.get("prob_count", 0) > 0 else None
         self.created_at = time.time()
 
     def add_chunk(self, chunk_index, audio_data):
@@ -66,19 +68,29 @@ class ClipAssembler:
         return (time.time() - self.created_at) > CLIP_TIMEOUT_SECONDS
 
     def assemble(self):
+        """Returns (audio_bytes, probability_bytes_or_None)."""
         audio = bytearray()
+        prob_data = None
+
         for i in range(self.total_chunks):
-            if i in self.chunks:
+            if i == self.prob_chunk_index and i in self.chunks:
+                prob_data = self.chunks[i]
+            elif i in self.chunks:
                 audio.extend(self.chunks[i])
-        return bytes(audio)
+
+        return bytes(audio), prob_data
 
 
 def parse_first_packet(data):
-    if len(data) < FIRST_HEADER_SIZE or data[:4] != MAGIC:
+    if len(data) < FIRST_HEADER_SIZE_V1 or data[:4] != MAGIC:
         return None, None, None
 
     version = data[4]
-    if version != 1:
+    if version not in (1, 2):
+        return None, None, None
+
+    header_size = FIRST_HEADER_SIZE_V2 if version >= 2 else FIRST_HEADER_SIZE_V1
+    if len(data) < header_size:
         return None, None, None
 
     det_type = data[5]
@@ -92,6 +104,7 @@ def parse_first_packet(data):
     wake_word = data[24:56].split(b"\x00")[0].decode("utf-8", errors="replace")
 
     metadata = {
+        "version": version,
         "detection_type": DETECTION_TYPES.get(det_type, f"unknown_{det_type}"),
         "max_probability": round(max_prob / 255.0, 3),
         "avg_probability": round(avg_prob / 255.0, 3),
@@ -101,9 +114,15 @@ def parse_first_packet(data):
         "total_chunks": total_chunks,
         "clip_id": clip_id,
         "wake_word": wake_word,
+        "prob_count": 0,
+        "prob_step_ms": 0,
     }
 
-    audio_data = data[FIRST_HEADER_SIZE:]
+    if version >= 2:
+        metadata["prob_count"] = struct.unpack_from("<H", data, 56)[0]
+        metadata["prob_step_ms"] = struct.unpack_from("<H", data, 58)[0]
+
+    audio_data = data[header_size:]
     return clip_id, metadata, audio_data
 
 
@@ -120,7 +139,7 @@ def parse_data_packet(data):
 
 def save_clip(assembler, output_dir):
     meta = assembler.metadata
-    audio = assembler.assemble()
+    audio, prob_data = assembler.assemble()
 
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     filename = (
@@ -142,6 +161,14 @@ def save_clip(assembler, output_dir):
     meta_copy["timestamp"] = timestamp
     meta_copy["received_chunks"] = len(assembler.chunks)
     meta_copy["audio_bytes"] = len(audio)
+
+    # Save probability timeline if available
+    if prob_data and meta.get("prob_count", 0) > 0:
+        prob_list = list(prob_data[:meta["prob_count"]])
+        meta_copy["probability_timeline"] = [round(p / 255.0, 3) for p in prob_list]
+        meta_copy["probability_raw"] = prob_list
+        meta_copy["prob_step_ms"] = meta.get("prob_step_ms", 10)
+
     with open(meta_path, "w") as f:
         json.dump(meta_copy, f, indent=2)
 
@@ -173,9 +200,9 @@ def main():
             except socket.timeout:
                 data = None
 
-            if data and len(data) >= FIRST_HEADER_SIZE and data[:4] == MAGIC:
+            if data and len(data) >= FIRST_HEADER_SIZE_V1 and data[:4] == MAGIC:
                 chunk_index_at_18 = struct.unpack_from("<H", data, 18)[0]
-                if chunk_index_at_18 == 0 and data[4] == 1:
+                if chunk_index_at_18 == 0 and data[4] in (1, 2):
                     clip_id, metadata, audio = parse_first_packet(data)
                     if clip_id is not None and clip_id not in active_clips:
                         assembler = ClipAssembler(clip_id, metadata)
