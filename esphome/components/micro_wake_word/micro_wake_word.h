@@ -161,10 +161,6 @@ class MicroWakeWord : public Component
   bool init_clip_socket_();
   /// @brief FreeRTOS task that sends clips over UDP
   static void clip_send_task(void *params);
-  /// @brief Allocates clip capture buffers (called when inference starts)
-  bool allocate_clip_buffers_();
-  /// @brief Frees clip capture buffers (called when inference stops)
-  void deallocate_clip_buffers_();
 
   // Circular audio buffer (PSRAM)
   uint8_t *clip_buffer_{nullptr};

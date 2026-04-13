@@ -120,10 +120,6 @@ void MicroWakeWord::setup() {
   });
 
   // --- Clip capture setup ---
-  // Buffers are allocated/freed dynamically with the mWW lifecycle (see allocate_clip_buffers_ /
-  // deallocate_clip_buffers_) so that memory is available for TTS playback when mWW is stopped.
-  // Here we only compute sizes, register the (null-guarded) mic callback, init the socket, and
-  // create the persistent send task.
   if (this->clip_receiver_port_ > 0) {
     uint32_t total_clip_ms = this->clip_preroll_ms_ + this->clip_postroll_ms_;
     this->clip_buffer_size_ = this->microphone_source_->get_audio_stream_info().ms_to_bytes(total_clip_ms);
@@ -132,20 +128,38 @@ void MicroWakeWord::setup() {
     // Probability buffer: one uint8 per inference step across the clip duration
     this->prob_buffer_size_ = total_clip_ms / this->features_step_size_;
 
-    ESP_LOGI(TAG, "Clip capture configured: %u ms buffer (%u bytes), sending to %s:%u (buffers allocated on start)",
-             total_clip_ms, this->clip_buffer_size_,
-             this->clip_receiver_host_.c_str(), this->clip_receiver_port_);
+    RAMAllocator<uint8_t> allocator;
+    this->clip_buffer_ = allocator.allocate(this->clip_buffer_size_);
+    this->clip_send_buffer_ = allocator.allocate(this->clip_send_buffer_size_);
+    this->prob_buffer_ = allocator.allocate(this->prob_buffer_size_);
+    this->prob_send_buffer_ = allocator.allocate(this->prob_buffer_size_);
 
-    // Register a data callback for clip capture (null-guarded: no-ops when buffers aren't allocated)
-    this->microphone_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
-      this->write_to_clip_buffer_(data.data(), data.size());
-    });
+    if (this->clip_buffer_ == nullptr || this->clip_send_buffer_ == nullptr ||
+        this->prob_buffer_ == nullptr || this->prob_send_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate clip capture buffers");
+      if (this->clip_buffer_ != nullptr) { allocator.deallocate(this->clip_buffer_, this->clip_buffer_size_); this->clip_buffer_ = nullptr; }
+      if (this->clip_send_buffer_ != nullptr) { allocator.deallocate(this->clip_send_buffer_, this->clip_send_buffer_size_); this->clip_send_buffer_ = nullptr; }
+      if (this->prob_buffer_ != nullptr) { allocator.deallocate(this->prob_buffer_, this->prob_buffer_size_); this->prob_buffer_ = nullptr; }
+      if (this->prob_send_buffer_ != nullptr) { allocator.deallocate(this->prob_send_buffer_, this->prob_buffer_size_); this->prob_send_buffer_ = nullptr; }
+      this->clip_receiver_port_ = 0;
+    } else {
+      memset(this->clip_buffer_, 0, this->clip_buffer_size_);
+      memset(this->prob_buffer_, 0, this->prob_buffer_size_);
+      ESP_LOGI(TAG, "Clip capture: %u ms buffer (%u bytes), sending to %s:%u",
+               total_clip_ms, this->clip_buffer_size_,
+               this->clip_receiver_host_.c_str(), this->clip_receiver_port_);
 
-    this->init_clip_socket_();
+      // Register a second data callback for clip capture
+      this->microphone_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
+        this->write_to_clip_buffer_(data.data(), data.size());
+      });
 
-    // Create the clip send task (low priority, doesn't block mic/inference)
-    xTaskCreatePinnedToCore(MicroWakeWord::clip_send_task, "mww_clip", 4096, (void *) this,
-                            5, &this->clip_send_task_handle_, 0);
+      this->init_clip_socket_();
+
+      // Create the clip send task (low priority, doesn't block mic/inference)
+      xTaskCreatePinnedToCore(MicroWakeWord::clip_send_task, "mww_clip", 4096, (void *) this,
+                              5, &this->clip_send_task_handle_, 0);
+    }
   }
 
 #ifdef USE_OTA_STATE_LISTENER
@@ -300,7 +314,6 @@ void MicroWakeWord::loop() {
 
   if (event_group_bits & EventGroupBits::TASK_RUNNING) {
     ESP_LOGD(TAG, "Inference task is running");
-    this->allocate_clip_buffers_();
 
     xEventGroupClearBits(this->event_group_, EventGroupBits::TASK_RUNNING);
     this->set_state_(State::DETECTING_WAKE_WORD);
@@ -313,7 +326,6 @@ void MicroWakeWord::loop() {
 
   if ((event_group_bits & EventGroupBits::TASK_STOPPED)) {
     ESP_LOGD(TAG, "Inference task is finished, freeing task resources");
-    this->deallocate_clip_buffers_();
     vTaskDelete(this->inference_task_handle_);
     this->inference_task_handle_ = nullptr;
     xEventGroupClearBits(this->event_group_, ALL_BITS);
@@ -537,55 +549,6 @@ bool MicroWakeWord::update_model_probabilities_(const int8_t audio_features[PREP
 }
 
 // --- Clip capture implementation ---
-
-bool MicroWakeWord::allocate_clip_buffers_() {
-  if (this->clip_receiver_port_ == 0 || this->clip_buffer_size_ == 0)
-    return false;
-  if (this->clip_buffer_ != nullptr)
-    return true;  // Already allocated
-
-  RAMAllocator<uint8_t> allocator;
-  this->clip_buffer_ = allocator.allocate(this->clip_buffer_size_);
-  this->clip_send_buffer_ = allocator.allocate(this->clip_send_buffer_size_);
-  this->prob_buffer_ = allocator.allocate(this->prob_buffer_size_);
-  this->prob_send_buffer_ = allocator.allocate(this->prob_buffer_size_);
-
-  if (this->clip_buffer_ == nullptr || this->clip_send_buffer_ == nullptr ||
-      this->prob_buffer_ == nullptr || this->prob_send_buffer_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate clip capture buffers");
-    deallocate_clip_buffers_();
-    return false;
-  }
-
-  memset(this->clip_buffer_, 0, this->clip_buffer_size_);
-  memset(this->prob_buffer_, 0, this->prob_buffer_size_);
-  this->clip_write_pos_ = 0;
-  this->prob_write_pos_ = 0;
-  this->clip_capture_pending_.store(false);
-  ESP_LOGI(TAG, "Clip capture buffers allocated (%u bytes)", this->clip_buffer_size_ * 2);
-  return true;
-}
-
-void MicroWakeWord::deallocate_clip_buffers_() {
-  RAMAllocator<uint8_t> allocator;
-  if (this->clip_buffer_ != nullptr) {
-    allocator.deallocate(this->clip_buffer_, this->clip_buffer_size_);
-    this->clip_buffer_ = nullptr;
-  }
-  if (this->clip_send_buffer_ != nullptr) {
-    allocator.deallocate(this->clip_send_buffer_, this->clip_send_buffer_size_);
-    this->clip_send_buffer_ = nullptr;
-  }
-  if (this->prob_buffer_ != nullptr) {
-    allocator.deallocate(this->prob_buffer_, this->prob_buffer_size_);
-    this->prob_buffer_ = nullptr;
-  }
-  if (this->prob_send_buffer_ != nullptr) {
-    allocator.deallocate(this->prob_send_buffer_, this->prob_buffer_size_);
-    this->prob_send_buffer_ = nullptr;
-  }
-  ESP_LOGI(TAG, "Clip capture buffers freed");
-}
 
 void MicroWakeWord::set_clip_receiver(const std::string &host, uint16_t port) {
   this->clip_receiver_host_ = host;
